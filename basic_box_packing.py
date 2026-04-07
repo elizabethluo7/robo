@@ -1,143 +1,156 @@
 import numpy as np
 import itertools
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import matplotlib.colors as mcolors
+
 
 class Box:
     def __init__(self, size, name=None):
-        self.size = np.array(size)  # (dx, dy, dz)
+        self.size = np.array(size)
         self.name = name
 
 class PlacedBox:
     def __init__(self, box, position):
         self.box = box
-        self.position = np.array(position)  # bottom-left-front corner
+        self.position = np.array(position)
 
     def get_bounds(self):
-        min_corner = self.position
-        max_corner = self.position + self.box.size
-        return min_corner, max_corner
-    
-def overlap(a: PlacedBox, b: PlacedBox):
-    min1, max1 = a.get_bounds()
-    min2, max2 = b.get_bounds()
-
-    return np.all(max1 > min2) and np.all(max2 > min1)
+        return self.position, self.position + self.box.size
 
 class Container:
     def __init__(self, size):
         self.size = np.array(size)
         self.placed = []
+        self.points = [np.array([0, 0, 0])]
 
     def fits_inside(self, placed_box):
         min_c, max_c = placed_box.get_bounds()
         return np.all(min_c >= 0) and np.all(max_c <= self.size)
 
-    def is_valid(self, placed_box):
-        if not self.fits_inside(placed_box):
-            return False
+    def overlaps(self, placed_box):
         for other in self.placed:
-            if overlap(placed_box, other):
-                return False
-        return True
-    
-def generate_layer_positions(container, box, step=1.0):
-    x_max, y_max, z_max = container.size
-    dx, dy, dz = box.size
+            min1, max1 = placed_box.get_bounds()
+            min2, max2 = other.get_bounds()
+            if np.all(max1 > min2) and np.all(max2 > min1):
+                return True
+        return False
 
-    # possible z levels (bottom-up)
-    zs = np.arange(0, z_max - dz + step, step)
+    def add_box(self, box, position):
+        new_pb = PlacedBox(box, position)
+        self.placed.append(new_pb)
+        
+        p = position
+        s = box.size
+        new_points = [
+            p + [s[0], 0, 0], 
+            p + [0, s[1], 0], 
+            p + [0, 0, s[2]]  
+        ]
+        
+        for pt in new_points:
+            if np.all(pt < self.size) and not any(np.array_equal(pt, existing) for existing in self.points):
+                self.points.append(pt)
+        
+        
+        self.points.sort(key=lambda pt: (pt[2], pt[1], pt[0]))
 
-    for z in zs:
-        xs = np.arange(0, x_max - dx + step, step)
-        ys = np.arange(0, y_max - dy + step, step)
-
-        for x in xs:
-            for y in ys:
-                yield np.array([x, y, z])
-
-import itertools
-
-def get_rotations(size):
+def get_unique_rotations(size):
     return list(set(itertools.permutations(size)))
 
-def pack_boxes_layered(container, boxes, step=1.0):
+def pack_with_corners(container, boxes):
     boxes = sorted(boxes, key=lambda b: np.prod(b.size), reverse=True)
 
     for box in boxes:
-        print(f"Placing {box.name}...")
         placed = False
+        rotations = get_unique_rotations(box.size)
 
-        rotations = get_rotations(box.size)
+        for pt in container.points[:]:  
+            for rot in rotations:
+                candidate_box = Box(rot, name=box.name)
+                candidate_pb = PlacedBox(candidate_box, pt)
 
-        for rot in rotations:
-            rotated_box = Box(rot, name=box.name)
-
-            for pos in generate_layer_positions(container, rotated_box, step):
-                candidate = PlacedBox(rotated_box, pos)
-
-                if container.is_valid(candidate):
-                    container.placed.append(candidate)
-                    print(f"  → Placed at {pos} with rotation {rot}")
+                if container.fits_inside(candidate_pb) and not container.overlaps(candidate_pb):
+                    container.add_box(candidate_box, pt)
+                    container.points = [p for p in container.points if not np.array_equal(p, pt)]
                     placed = True
                     break
-
-            if placed:
-                break
-
+            if placed: break
+        
         if not placed:
-            print(f"  → Could not place {box.name}")
+            print(f"Could not place {box.name}")
 
-    return container
-
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-
-def plot_boxes(container):
-    fig = plt.figure()
+def plot_boxes_improved(container, title="3D Bin Packing (Corner Points)"):
+    """Visualizes the container and its contents."""
+    fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection='3d')
+    plt.title(title)
 
-    def draw_box(min_corner, max_corner):
+    # Use Tableau Colors for clear distinction, cycle if too many boxes
+    color_cycle = list(mcolors.TABLEAU_COLORS.values())
+
+    def draw_box(placed_box, color, index):
+        min_corner, max_corner = placed_box.get_bounds()
         x0, y0, z0 = min_corner
         x1, y1, z1 = max_corner
 
-        vertices = [
-            [(x0,y0,z0), (x1,y0,z0), (x1,y1,z0), (x0,y1,z0)],
-            [(x0,y0,z1), (x1,y0,z1), (x1,y1,z1), (x0,y1,z1)],
-            [(x0,y0,z0), (x1,y0,z0), (x1,y0,z1), (x0,y0,z1)],
-            [(x1,y0,z0), (x1,y1,z0), (x1,y1,z1), (x1,y0,z1)],
-            [(x1,y1,z0), (x0,y1,z0), (x0,y1,z1), (x1,y1,z1)],
-            [(x0,y1,z0), (x0,y0,z0), (x0,y0,z1), (x0,y1,z1)],
+        # Define the 6 faces using 3D vertices
+        faces = [
+            [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0)], # Floor (Zmin)
+            [(x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)], # Ceiling (Zmax)
+            [(x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1)], # Front (Ymin)
+            [(x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1)], # Right (Xmax)
+            [(x1, y1, z0), (x0, y1, z0), (x0, y1, z1), (x1, y1, z1)], # Back (Ymax)
+            [(x0, y1, z0), (x0, y0, z0), (x0, y0, z1), (x0, y1, z1)], # Left (Xmin)
         ]
 
-        ax.add_collection3d(
-            Poly3DCollection(vertices, edgecolor='black', alpha=0.4)
-        )
+        # Draw the faces
+        face_collection = Poly3DCollection(faces, facecolors=color, linewidths=0.5, edgecolors='black', alpha=0.6)
+        ax.add_collection3d(face_collection)
 
-    # Draw each placed box
-    for pb in container.placed:
-        min_c, max_c = pb.get_bounds()
-        draw_box(min_c, max_c)
+        # Optional: Label the box (centered)
+        # label_pos = min_corner + (placed_box.box.size / 2.0)
+        # ax.text(label_pos[0], label_pos[1], label_pos[2], f"{placed_box.box.name}", color='black', ha='center', va='center', fontsize=8)
 
-    # Set limits
+    # 1. Draw all placed boxes
+    for i, pb in enumerate(container.placed):
+        color = color_cycle[i % len(color_cycle)]
+        draw_box(pb, color, i)
+
+    # 2. Configure axes and boundaries
     ax.set_xlim([0, container.size[0]])
     ax.set_ylim([0, container.size[1]])
     ax.set_zlim([0, container.size[2]])
 
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
+    ax.set_xlabel('X (Width)')
+    ax.set_ylabel('Y (Length)')
+    ax.set_zlabel('Z (Height)')
 
+    # Maintain the aspect ratio properly
+    ax.set_box_aspect(container.size) 
+
+    print(f"Visualization complete. Displaying plot.")
     plt.show()
 
+# --- Example Usage ---
 if __name__ == "__main__":
-    container = Container(size=[4, 8, 10])
+    bin_size = [10, 6, 8]
+    cont = Container(bin_size)
+    items = [
+            Box([6, 6, 6], "Big A"),
+            Box([3, 3, 3], "Small B"),
+            Box([5, 2, 2], "Long C"),
+            Box([1, 1, 1], "Tiny D"),
+            Box([4, 4, 2], "Flat E"),
+            Box([2, 5, 2], "Tall F"),
+            Box([3, 2, 4], "Brick G"),
+        ]    
+    
+    
+    pack_with_corners(cont, items)
 
-    boxes = [
-        Box([4, 4, 4], "A"),
-        Box([3, 3, 3], "B"),
-        Box([2, 2, 2], "C"),
-        Box([1, 5, 2], "D"),
-    ]
 
-    pack_boxes_layered(container, boxes, step=1.0)
-
-    plot_boxes(container)
+    if cont.placed:
+        plot_boxes_improved(cont, title=f"Packing Simulation for Container {bin_size}")
+    else:
+        print("No items could be packed. Skipping visualization.")
