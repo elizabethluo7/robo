@@ -5,8 +5,8 @@ at least as crushable as every box directly supporting it. No cumulative
 load capacity or container weight limit is modeled. All dimensions and the
 hot/frozen gap use the same units; weights must use one consistent unit.
 Valid placements are ranked to reduce empty space and increase face contact.
-Hot/frozen separation is a scored preference by default, so it does not
-force an empty lane. Set strict_temperature_gap=True to require it.
+Hot/frozen separation favors intervening items rather than empty air.
+An item buffer is a geometric preference, not a heat-transfer simulation. Set strict_temperature_gap=True to require it.
 """
 from collections import Counter
 import itertools
@@ -57,7 +57,7 @@ class PlacedBox:
 
 
 class Container:
-    def __init__(self, size, temperature_gap=1.0, strict_temperature_gap=False, temperature_weight=0.15):
+    def __init__(self, size, temperature_gap=1.0, strict_temperature_gap=False, temperature_weight=1.0):
         self.size = dimensions(size)
         self.temperature_gap = float(temperature_gap)
         if not np.isfinite(self.temperature_gap) or self.temperature_gap < 0:
@@ -125,13 +125,14 @@ class Container:
             raise ValueError(f"Cannot place {box.name}: {', '.join(errors)}")
         self.placed.append(candidate)
         # Combine face coordinates to include corners formed by multiple boxes.
-        # Gap-offset faces give hot/frozen boxes a chance to satisfy separation.
+        # Empty-air offsets are used only in optional legacy strict-gap mode.
         axes = [{0.0} for _ in range(3)]
         for placed in self.placed:
             low, high = placed.get_bounds()
             for axis in range(3):
-                axes[axis].update((float(low[axis]), float(high[axis]),
-                                   float(high[axis] + self.temperature_gap)))
+                axes[axis].update((float(low[axis]), float(high[axis])))
+                if self.strict_temperature_gap:
+                    axes[axis].add(float(high[axis] + self.temperature_gap))
         self.points = [np.array(point) for point in itertools.product(*map(sorted, axes))
                        if np.all(np.array(point) < self.size - EPS)]
         self.points.sort(key=lambda point: (point[2], point[1], point[0]))
@@ -166,33 +167,80 @@ def packing_metrics(placed):
             "contact_area": contact, "envelope_volume": envelope}
 
 
-def temperature_shortfall(placed, preferred_gap):
-    """Average squared shortfall from the desired hot/frozen distance, 0..1.
-
-    An ambient item can occupy the separating space. This measures geometric
-    distance only, not insulation or heat transfer.
-    """
-    penalties = []
-    if preferred_gap <= EPS:
+def rectangle_union_area(rectangles):
+    """Area covered by clipped buffer projections, without double counting."""
+    if not rectangles:
         return 0.0
+    xs = sorted({float(r[i][0]) for r in rectangles for i in (0, 1)})
+    area = 0.0
+    for left, right in zip(xs, xs[1:]):
+        intervals = sorted((lo[1], hi[1]) for lo, hi in rectangles
+                           if lo[0] < right - EPS and hi[0] > left + EPS)
+        covered = 0.0
+        end = -float("inf")
+        for low, high in intervals:
+            covered += max(0.0, high - max(low, end))
+            end = max(end, high)
+        area += (right - left) * covered
+    return area
+
+
+def temperature_buffers(placed):
+    """Measure intervening item coverage for each hot/frozen pair.
+
+    A buffer must be between opposing faces, with positive thickness, and
+    overlap their facing area. Being nearby or on top of just one item does
+    not count. Multiple buffers may jointly cover that area. Empty air never
+    earns credit. Only non-hot/non-frozen items may be buffers.
+    """
+    result = []
     for first, second in itertools.combinations(placed, 2):
         if {first.box.temperature, second.box.temperature} != {"hot", "frozen"}:
             continue
-        a0, a1 = first.get_bounds()
-        b0, b1 = second.get_bounds()
-        distance = float(np.linalg.norm(np.maximum(0, np.maximum(a0 - b1, b0 - a1))))
-        penalties.append(max(0.0, 1 - distance / preferred_gap) ** 2)
-    return sum(penalties) / len(penalties) if penalties else 0.0
+        best_coverage, best_names = 0.0, []
+        for axis in range(3):
+            left, right = sorted((first, second), key=lambda p: p.position[axis])
+            l0, l1 = left.get_bounds()
+            r0, r1 = right.get_bounds()
+            if r0[axis] - l1[axis] <= EPS:
+                continue
+            projection = [i for i in range(3) if i != axis]
+            face_low = np.maximum(l0, r0)[projection]
+            face_high = np.minimum(l1, r1)[projection]
+            if np.any(face_high - face_low <= EPS):
+                continue
+            rectangles, names = [], []
+            for buffer in placed:
+                if buffer is first or buffer is second or buffer.box.temperature != "ambient":
+                    continue
+                low, high = buffer.get_bounds()
+                if low[axis] < l1[axis] - EPS or high[axis] > r0[axis] + EPS:
+                    continue
+                clipped_low = np.maximum(low[projection], face_low)
+                clipped_high = np.minimum(high[projection], face_high)
+                if np.all(clipped_high - clipped_low > EPS):
+                    rectangles.append((clipped_low, clipped_high))
+                    names.append(buffer.box.name or "Unnamed item")
+            coverage = rectangle_union_area(rectangles) / float(np.prod(face_high - face_low))
+            if coverage > best_coverage:
+                best_coverage, best_names = min(1.0, coverage), names
+        result.append({"items": (first.box.name, second.box.name),
+                       "coverage": best_coverage, "buffers": best_names})
+    return result
+
+
+def buffer_penalty(placed):
+    pairs = temperature_buffers(placed)
+    return sum(1 - pair["coverage"] for pair in pairs) / len(pairs) if pairs else 0.0
 
 
 def compactness_score(placed, container):
     metrics = packing_metrics(placed)
     item_volume = sum(float(np.prod(p.box.size)) for p in placed)
-    # Normalize by item volume so scores do not depend on inches vs centimeters.
-    # A 0.15 weight means a complete temperature shortfall must save more than
-    # 15% of item volume in empty space to be worthwhile.
+    # Balance compactness against the fraction of hot/frozen facing area
+    # without an intervening item. Distance alone does not improve the score.
     score = (metrics["empty_volume"] / max(item_volume, EPS)
-             + container.temperature_weight * temperature_shortfall(placed, container.temperature_gap))
+             + container.temperature_weight * buffer_penalty(placed))
     height = max((p.position[2] + p.box.size[2] for p in placed), default=0)
     return (round(score, 8), -round(metrics["contact_area"], 8), height)
 
@@ -204,7 +252,8 @@ def pack_with_corners(container, boxes):
     four deterministic orders to bound runtime. This searches useful layouts
     but does not guarantee a globally optimal packing. All
     support, weight, and crushability checks remain mandatory. Temperature
-    separation is a preference unless strict_temperature_gap is enabled.
+    buffering is a preference; strict_temperature_gap optionally enables the
+    legacy minimum-air-distance rule.
     """
     boxes = list(boxes)
     preferred = sorted(boxes, key=lambda b: (b.crushability, -b.weight, -np.prod(b.size)))
@@ -258,9 +307,10 @@ def pack_with_corners(container, boxes):
 def plot_boxes_improved(container, title="3D Packing: Weight, Crushability & Temperature"):
     fig = plt.figure(figsize=(11, 8))
     ax = fig.add_subplot(111, projection="3d")
-    shortfall = temperature_shortfall(container.placed, container.temperature_gap)
-    if shortfall > EPS:
-        title += "\nCompact mode: hot/frozen spacing preference relaxed"
+    pairs = temperature_buffers(container.placed)
+    if pairs:
+        title += "\n" + ("Item buffer found" if all(p["coverage"] >= 1 - EPS for p in pairs)
+                          else "Full item buffer not found; compact fallback")
     ax.set_title(title)
     for placed in container.placed:
         low, high = placed.get_bounds()
@@ -357,9 +407,11 @@ def run_grocery_test(case_number, show_plot=True):
     print(f"Occupied envelope: {metrics['envelope_volume']:g} cubic inches; "
           f"internal empty space: {metrics['empty_volume']:g} cubic inches; "
           f"touching face area: {metrics['contact_area']:g} square inches.")
-    shortfall = temperature_shortfall(container.placed, container.temperature_gap)
-    if shortfall > EPS:
-        print("Temperature preference relaxed for a tighter packing (strict mode is off).")
+    for pair in temperature_buffers(container.placed):
+        print(f"Hot/frozen pair {pair['items']}: item-buffer coverage={pair['coverage']:.0%}; "
+              f"buffers={pair['buffers']}")
+        if pair["coverage"] < 1 - EPS:
+            print("Full item buffer not found by this search; using a compact fallback.")
     print(f"PASS: all {len(items)} items fit, with stacking and all hard constraints satisfied.")
     if show_plot:
         plot_boxes_improved(container, title=f"Grocery case {case_number}: {title}")
